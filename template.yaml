@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'EC2 Auto Scheduler - 自动管理EC2实例启停'
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 256
+    Runtime: python3.9
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        CONFIG_TABLE_NAME: !Ref ConfigTable
+        LOG_LEVEL: INFO
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: 部署环境
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+Resources:
+  # DynamoDB配置表
+  ConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'ec2-scheduler-config-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: config_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: config_id
+          KeyType: HASH
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: EC2Scheduler
+
+  # Lambda执行角色
+  EC2SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2SchedulerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstanceStatus
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt ConfigTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: '*'
+
+  # Lambda函数
+  EC2SchedulerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'ec2-scheduler-${Environment}'
+      CodeUri: src/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt EC2SchedulerRole.Arn
+      Description: 'EC2实例自动启停调度器'
+      Tags:
+        Environment: !Ref Environment
+        Application: EC2Scheduler
+      Events:
+        ScheduleEvent:
+          Type: Schedule
+          Properties:
+            Schedule: 'rate(10 minutes)'  # 每10分钟检查一次
+            Description: 'EC2调度器定时触发'
+            Enabled: true
+
+  # CloudWatch日志组
+  EC2SchedulerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/ec2-scheduler-${Environment}'
+      RetentionInDays: 30
+
+  # 配置初始化Lambda
+  ConfigInitFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'ec2-scheduler-config-init-${Environment}'
+      CodeUri: src/
+      Handler: config_init.lambda_handler
+      Role: !GetAtt EC2SchedulerRole.Arn
+      Description: '初始化EC2调度器配置'
+      Environment:
+        Variables:
+          CONFIG_TABLE_NAME: !Ref ConfigTable
+
+  # 自定义资源用于初始化配置
+  ConfigInitCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ConfigInitFunction.Arn
+      TableName: !Ref ConfigTable
+
+Outputs:
+  ConfigTableName:
+    Description: 'DynamoDB配置表名称'
+    Value: !Ref ConfigTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigTable'
+
+  LambdaFunctionName:
+    Description: 'Lambda函数名称'
+    Value: !Ref EC2SchedulerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'Lambda函数ARN'
+    Value: !GetAtt EC2SchedulerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
